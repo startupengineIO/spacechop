@@ -28,7 +28,9 @@ export const requestHandler = (
   config: Config, keys,
   sources: Source[],
   storage?: IStorage,
+  monitor?: any,
 ) => async (req: Request, res: Response) => {
+  const handle = monitor.monitorResponse(res);
   // Create trace instance.
   const trace = new Trace();
   // Extract params from request (enables the use of dynamic named params (.*)).
@@ -45,6 +47,7 @@ export const requestHandler = (
     trace.warn('preset', 'Could not find preset');
     return;
   } else {
+    res.set('X-Preset', params.preset);
     trace.log('preset', preset);
   }
 
@@ -67,19 +70,23 @@ export const requestHandler = (
     // It exists in cache
     if (fromCache && fromCache.contentType) {
       res.set('Content-Type', fromCache.contentType);
+      res.set('X-Cache', 'HIT');
       fromCache.stream.pipe(res);
       return;
     }
   }
 
   // look through sources to fetch original source stream
-  const stream = await lookThroughSources(sources, params);
+  const { stream, key } = await lookThroughSources(sources, params);
 
   if (!stream) {
     res.status(404);
     res.end('Could not find image');
     trace.warn('image', 'Could not find image');
     return;
+  } else {
+    res.set('X-Key', key);
+    trace.log('original', key);
   }
 
   // Only analyze image after pipeline
@@ -93,6 +100,7 @@ export const requestHandler = (
     trace.log('definition', definition);
     const contentType = formatToMime(definition.type);
     res.set('Content-Type', contentType);
+    res.set('X-Cache', 'MISS');
     // Send image data through the worker which passes through to response.
 
     let streamToRespondWith = transformed;
@@ -102,12 +110,21 @@ export const requestHandler = (
       const streamToCache = streamSwitch.createReadStream();
       uploadToStorage(storage, params, streamToCache, contentType);
     }
+    let size = 0;
     streamToRespondWith.pipe(res);
-    streamToRespondWith.on('end', () => trace.end());
+    streamToRespondWith.on('data', (chunk) => {
+      size += chunk.length;
+    });
+    streamToRespondWith.on('end', () => {
+      trace.end();
+      // Log the size of the output.
+      trace.log('size', size);
+      handle.close(size);
+    });
   }
 };
 
-export default (config: Config, server) => {
+export default (config: Config, server, monitor) => {
   if (!config) {
     return;
   }
@@ -120,7 +137,7 @@ export default (config: Config, server) => {
   paths.forEach((path) => {
     const keys = [];
     const pattern = pathToRegex(path, keys);
-    const handler = requestHandler(config, keys, sources, storage);
+    const handler = requestHandler(config, keys, sources, storage, monitor);
     server.get(pattern, asyncWrapper(handler, handleError));
   });
 };
